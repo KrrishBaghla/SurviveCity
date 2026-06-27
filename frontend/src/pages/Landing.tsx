@@ -123,13 +123,6 @@ function Hero({ state }: { state: any }) {
 function Pillars() {
   const items = [
     {
-      icon: <Icon.Brain size={22} />,
-      tag: "theme 4",
-      title: "Failure-Replay Memory",
-      body: "Each death emits a deterministic post-mortem. The next episode's system prompt prepends them — agents literally learn from how they die.",
-      tint: "from-neon-violet/30",
-    },
-    {
       icon: <Icon.Network size={22} />,
       tag: "theme 1",
       title: "Hidden-Role ToM",
@@ -142,6 +135,13 @@ function Pillars() {
       title: "100-Step Long Horizon",
       body: "Phased mechanics: survival → reveal → vote → post-vote. Long enough that strategy compounds, short enough to train on a free T4.",
       tint: "from-neon-cyan/30",
+    },
+    {
+      icon: <Icon.Brain size={22} />,
+      tag: "theme 4",
+      title: "Failure-Replay Memory",
+      body: "Each death emits a deterministic post-mortem. The next episode's system prompt prepends them — agents literally learn from how they die.",
+      tint: "from-neon-violet/30",
     },
     {
       icon: <Icon.Shield size={22} />,
