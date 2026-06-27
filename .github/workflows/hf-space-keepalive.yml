@@ -1,0 +1,60 @@
+# Keep the SurviveCity v1 Hugging Face Space awake during the hackathon
+# judging window. HF Spaces on free tier sleep after ~48h of inactivity, but
+# can also be evicted under quota pressure mid-day. A periodic /health ping
+# from GitHub Actions costs nothing and keeps the container hot.
+#
+# Notes for next time:
+#   - GitHub's cron has a 5-minute minimum and is "best-effort" — actual
+#     firing can be delayed 5-15min during platform load. That's fine for
+#     keepalive (15min still well under the sleep threshold).
+#   - Scheduled workflows are auto-disabled on a public repo if there's been
+#     no commit in 60 days. Push *anything* periodically or it stops.
+#   - This is also runnable on demand from the Actions tab via
+#     workflow_dispatch — useful right before a demo.
+
+name: HF Space keepalive
+on:
+  schedule:
+    - cron: "*/12 * * * *"   # every 12 minutes
+  workflow_dispatch:
+  push:
+    branches: [master, main]
+    paths: [".github/workflows/hf-space-keepalive.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hf-space-keepalive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: zombiee-v1
+            url:  https://noanya-zombiee.hf.space/health
+    steps:
+      - name: Ping ${{ matrix.target.name }}
+        env:
+          URL: ${{ matrix.target.url }}
+          NAME: ${{ matrix.target.name }}
+        run: |
+          set -euo pipefail
+          echo "▸ ${NAME}: GET ${URL}"
+          # Retry up to 3 times with backoff; ignore non-fatal slow starts.
+          RESP=$(curl -fsSL --max-time 30 --retry 3 --retry-delay 5 \
+                       --retry-connrefused -H "User-Agent: zombiee-keepalive/1.0" \
+                       "${URL}")
+          echo "  response: ${RESP}"
+          # Cheap content check: must mention "healthy" — guards against the
+          # Space serving a 200 from a sleep/cold-start placeholder page.
+          echo "${RESP}" | grep -q "healthy" || {
+            echo "  warn: response did not contain 'healthy' — Space may be cold-starting"
+            exit 1
+          }
+          echo "  ok"

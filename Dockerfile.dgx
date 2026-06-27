@@ -1,0 +1,84 @@
+FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 python3.11-dev python3.11-venv python3-pip git curl gcc \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --upgrade pip setuptools wheel \
+    --trusted-host pypi.org --trusted-host files.pythonhosted.org
+
+RUN pip install --no-cache-dir \
+    torch==2.5.1 torchvision \
+    --index-url https://download.pytorch.org/whl/cu121 \
+    --trusted-host download.pytorch.org
+
+RUN pip install --no-cache-dir \
+    --trusted-host pypi.org --trusted-host files.pythonhosted.org \
+    "transformers==4.40.2" \
+    "accelerate==0.30.1" \
+    "peft==0.10.0" \
+    "datasets==2.19.1" \
+    "trl==0.8.6"
+
+RUN pip install --no-cache-dir \
+    --trusted-host pypi.org --trusted-host files.pythonhosted.org \
+    "bitsandbytes>=0.41"
+
+RUN pip install --no-cache-dir \
+    --trusted-host pypi.org --trusted-host files.pythonhosted.org \
+    "unsloth[cu121-torch250] @ git+https://github.com/unslothai/unsloth.git"
+
+# Pin torchao to 0.7.0 — last release compatible with torch 2.5.x.
+# Newer torchao (>=0.8) references torch.int1 (only present in torch 2.6+),
+# and transformers/quantizers/auto.py imports torchao eagerly at module load,
+# breaking `import unsloth` / `import transformers` with AttributeError.
+RUN pip install --no-cache-dir --force-reinstall --no-deps \
+    --trusted-host pypi.org --trusted-host files.pythonhosted.org \
+    "torchao==0.7.0"
+
+# Sanity-check the import chain so the build fails fast if torchao regresses.
+# We deliberately skip `import unsloth` here — unsloth_zoo runs a CUDA-availability
+# probe at import time, and `docker build` has no GPU exposed (only `docker run --gpus`).
+# The real regression we are guarding against is transformers/quantizers/auto.py
+# eagerly importing torchao and hitting `torch.int1`, so we exercise that path.
+RUN python -c "import torch, torchao, transformers; \
+from transformers.processing_utils import Unpack; \
+from transformers.quantizers.auto import AutoHfQuantizer; \
+print('torch', torch.__version__); \
+print('torchao', torchao.__version__); \
+print('transformers', transformers.__version__); \
+print('quantizer import chain ok')"
+
+RUN pip install --no-cache-dir \
+    --trusted-host pypi.org --trusted-host files.pythonhosted.org \
+    wandb "matplotlib>=3.8" tensorboard
+
+RUN pip install --no-cache-dir \
+    --trusted-host pypi.org --trusted-host files.pythonhosted.org \
+    "pydantic>=2.0" "fastapi>=0.104" "uvicorn[standard]>=0.24"
+
+COPY survivecity_env/ survivecity_env/
+COPY server/ server/
+COPY training/ training/
+COPY openenv.yaml pyproject.toml ./
+
+RUN mkdir -p plots lora_v1
+
+EXPOSE 7860
+
+CMD bash -c "\
+    echo '=== Starting SurviveCity env server ===' && \
+    uvicorn server.app:app --host 0.0.0.0 --port 7860 & \
+    sleep 3 && \
+    echo '=== Starting GRPO training ===' && \
+    python -m training.train \
+        --env-url http://localhost:7860 \
+        --max-steps 4000 \
+        --output-dir /app/lora_v1 \
+        --report-to tensorboard && \
+    echo '=== Training complete ===' \
+"

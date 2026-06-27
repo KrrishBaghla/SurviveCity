@@ -1,0 +1,374 @@
+# DGX runtime image for v1 zombiee (training/ + survivecity_env/).
+#
+# Based on D:\projs\extra\v2\zombiee-v2\Dockerfile.dgx.bak — that file was
+# validated end-to-end on actual DGX hardware. We copy its dep-install
+# strategy verbatim (it survives the four cascading dep failures the team
+# burned a week diagnosing) and only swap the COPY paths from v2 to v1
+# (survivecity_env vs survivecity_v2_env, slightly different train.py CLI).
+#
+# DEPENDENCY HISTORY (from the v2 .bak file — DO NOT change without
+# replicating its smoke test):
+#
+#   1. peft >=0.13 demands torchao >= 0.16, but torch 2.5 only takes
+#      torchao <= 0.7 → solution: leave torchao UNINSTALLED. peft's
+#      `is_torchao_available()` returns False cleanly.
+#   2. trl 0.15+ chain-imports `mergekit` from callbacks.py unconditionally
+#      → solution: install the real mergekit (its deps don't conflict).
+#   3. trl 0.15+ chain-imports `llm_blender` from judges.py unconditionally
+#      → solution: STUB it out with a 6-line in-place package. Real
+#      llm_blender drags in pytorch-lightning + sentence-transformers
+#      that conflict with our pinned transformers/peft. Our GRPO code
+#      never instantiates a judge, so the stub is sufficient.
+#   4. Some libs still reference removed `transformers.utils.hub.TRANSFORMERS_CACHE`
+#      → solution: append a one-line alias to hub.py at build time.
+#
+# Tradeoff vs unsloth: ~20-30% slower per step, but cleaner dep resolution
+# and no surprise version drift.
+#
+# DGX-FRIENDLY POSTURE (matches v2's pre-trim run_train100.sh shape):
+#   - No Hub push by default — pass HUB_REPO env var to opt in.
+#   - No FastAPI status sidecar — that was for HF Spaces, irrelevant on DGX.
+#   - Logs go to stdout/stderr; no log-file rotation noise.
+#   - All artefacts under /app/lora_dgx and /app/plots; mount them as
+#     volumes from the host.
+#
+# Build:
+#   docker build -f Dockerfile.dgx.kaggle -t zombiee-dgx .
+#
+# Train:
+#   docker run --rm --gpus '"device=0"' \
+#       -v $PWD/lora_dgx:/app/lora_dgx \
+#       -v $PWD/logs:/app/logs \
+#       zombiee-dgx train
+#
+# Eval:
+#   docker run --rm --gpus '"device=0"' \
+#       -e HF_TOKEN=hf_xxx \
+#       -e EXTENDED_REPO=noanya/zombiee-v1-extended \
+#       -v $PWD/lora_dgx:/app/lora_dgx \
+#       -v $PWD/plots:/app/plots \
+#       zombiee-dgx eval
+
+FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TOKENIZERS_PARALLELISM=false \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.11 python3.11-dev python3.11-venv python3-pip git curl gcc \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --upgrade pip setuptools wheel \
+    --trusted-host pypi.org --trusted-host files.pythonhosted.org
+
+# torch first — large, isolate for cache hits on dep iterations.
+RUN pip install --no-cache-dir \
+        torch==2.5.1 torchvision \
+        --index-url https://download.pytorch.org/whl/cu121 \
+        --trusted-host download.pytorch.org
+
+# Core training stack (release-window-aligned versions trl 0.15 was tested against).
+RUN pip install --no-cache-dir \
+        --trusted-host pypi.org --trusted-host files.pythonhosted.org \
+        "transformers==4.46.3" \
+        "accelerate==1.1.1" \
+        "peft==0.13.2" \
+        "datasets==3.1.0" \
+        "trl==0.15.2"
+
+# 4-bit quantisation (default path — train.py picks it up automatically).
+RUN pip install --no-cache-dir \
+        --trusted-host pypi.org --trusted-host files.pythonhosted.org \
+        "bitsandbytes>=0.43"
+
+# trl 0.15+ chain-imports mergekit unconditionally; install the real one.
+RUN pip install --no-cache-dir \
+        --trusted-host pypi.org --trusted-host files.pythonhosted.org \
+        "mergekit"
+
+# Patch transformers.utils.hub.py to add the legacy TRANSFORMERS_CACHE alias.
+# Cheap insurance for any optional dep still on the old name.
+RUN HUB_PY=/usr/local/lib/python3.11/dist-packages/transformers/utils/hub.py \
+ && grep -q '^TRANSFORMERS_CACHE' "$HUB_PY" \
+    || printf '\n# Legacy alias (added by Dockerfile.dgx.kaggle)\nTRANSFORMERS_CACHE = HF_HUB_CACHE if "HF_HUB_CACHE" in dir() else "~/.cache/huggingface/hub"\n' >> "$HUB_PY"
+
+# Stub llm_blender so trl's `import llm_blender` succeeds without dragging
+# in the real package's incompatible dep tree. Identical to v2's stub.
+RUN pip uninstall -y llm-blender 2>/dev/null || true \
+ && rm -rf /usr/local/lib/python3.11/dist-packages/llm_blender \
+ && mkdir -p /usr/local/lib/python3.11/dist-packages/llm_blender \
+ && printf '%s\n' \
+    '"""Stub llm_blender — zombiee v1 DGX does not use judge functionality."""' \
+    '' \
+    'class Blender:' \
+    '    def __init__(self, *args, **kwargs):' \
+    '        raise RuntimeError("llm_blender.Blender is stubbed in zombiee v1 DGX.")' \
+    '    def loadranker(self, *args, **kwargs): pass' \
+    '    def loadfuser(self, *args, **kwargs): pass' \
+    '    def rank(self, *args, **kwargs): raise RuntimeError("llm_blender stubbed")' \
+    '    def fuse(self, *args, **kwargs): raise RuntimeError("llm_blender stubbed")' \
+    > /usr/local/lib/python3.11/dist-packages/llm_blender/__init__.py
+
+# Belt-and-suspenders: ensure torchao is NOT installed (peft 0.13 strict check).
+RUN pip uninstall -y torchao || true
+
+# Full-path import smoke test — fails the BUILD if any of the v2-validated
+# import chain regresses, instead of crashing the actual training run.
+RUN python -c "\
+import importlib.util; \
+import torch, transformers, peft, datasets, accelerate, bitsandbytes, huggingface_hub, trl; \
+import mergekit, llm_blender; \
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig; \
+from transformers.processing_utils import Unpack; \
+from transformers.quantizers.auto import AutoHfQuantizer; \
+from transformers.utils.hub import TRANSFORMERS_CACHE; \
+from peft import get_peft_model, LoraConfig, prepare_model_for_kbit_training, PeftModel; \
+from trl import GRPOTrainer, GRPOConfig; \
+ta = importlib.util.find_spec('torchao'); \
+print('torch       ', torch.__version__); \
+print('transformers', transformers.__version__); \
+print('peft        ', peft.__version__); \
+print('trl         ', trl.__version__); \
+print('bitsandbytes', bitsandbytes.__version__); \
+print('mergekit    present, llm_blender stub present'); \
+print('torchao     ', 'absent (intended)' if ta is None else 'PRESENT (unexpected)'); \
+assert ta is None; \
+print('FULL TRAINING IMPORT CHAIN OK')"
+
+# Plotting / progress bars / mem watchdog. NO wandb, NO hf_transfer — DGX
+# runs are local, we don't need streaming uploads or W&B.
+RUN pip install --no-cache-dir \
+        --trusted-host pypi.org --trusted-host files.pythonhosted.org \
+        "matplotlib>=3.8" "numpy>=1.24" tensorboard \
+        "huggingface_hub>=0.20" \
+        "tqdm>=4.66" "psutil>=5.9"
+
+# Server deps (only used by the optional `serve` mode).
+RUN pip install --no-cache-dir \
+        --trusted-host pypi.org --trusted-host files.pythonhosted.org \
+        "pydantic>=2.0" "fastapi>=0.104" "uvicorn[standard]>=0.24"
+
+# Source — copy after deps so iterative edits don't bust the dep cache.
+COPY survivecity_env/ survivecity_env/
+COPY server/           server/
+COPY training/         training/
+COPY openenv.yaml      ./
+COPY pyproject.toml    ./
+
+# In-container patch #1: TRL 0.15+ requires
+#   (per_device_batch * num_processes) % num_generations == 0
+# v1 hardcodes per_device_train_batch_size=1; pair per_device=2 with the
+# entrypoint's `--num-generations 2`. Total compute per step (1×16×4=64
+# evaluations originally) is preserved as 2×16×2=64. Repo file on host
+# stays untouched.
+RUN sed -i 's/per_device_train_batch_size=1,/per_device_train_batch_size=4,  # dgx patch: per_device=4 unlocks num_gen=4,8,12 on 30GB/' training/train.py \
+ && grep -q "per_device_train_batch_size=4," training/train.py \
+ && echo "patched per_device_train_batch_size 1 -> 4"
+
+# In-container patch #2 (mirrors v2's training/train.py): force tqdm on +
+# add a per-step progress callback that prints clean "[progress] step N/M
+# step_time=… eta=…" and "[metrics] step N: {loss, reward, ...}" lines.
+# HF Trainer auto-disables tqdm under non-TTY (docker logs / nohup), so we
+# both flip disable_tqdm=False and add an explicit logger callback so the
+# progress is readable in `docker logs` AND `tee`-piped output.
+RUN python - <<'PY'
+import pathlib, re
+tp = pathlib.Path("training/train.py")
+src = tp.read_text()
+if "_DGX_StepProgressCallback" in src:
+    print("train.py progress patch already applied"); raise SystemExit(0)
+
+# 1) Force tqdm on inside GRPOConfig(...). The closing line is `seed=args.seed)`.
+new_src = src.replace(
+    "        seed=args.seed)",
+    "        seed=args.seed,\n        disable_tqdm=False)",
+    1,
+)
+assert new_src != src, "could not find GRPOConfig closing line"
+src = new_src
+
+# 2) Inject callback class + add_callback() right after the GRPOTrainer
+#    construction. Anchor on the unique closing line of the constructor.
+ANCHOR = "        train_dataset=dataset, processing_class=tokenizer)"
+INJECT = '''
+
+    # DGX patch: per-step progress callback (mirrors v2's StepProgressCallback).
+    # tqdm is unreliable under docker/nohup; this guarantees one clean log line
+    # per step + a metrics dump on every logging_steps boundary.
+    import time as _dgx_time
+    from transformers import TrainerCallback as _DGX_TrainerCallback
+    class _DGX_StepProgressCallback(_DGX_TrainerCallback):
+        def on_train_begin(self, a, s, c, **kw):
+            self._t0 = _dgx_time.time()
+            logger.info(f"[progress] training begin: max_steps={s.max_steps}")
+        def on_step_begin(self, a, s, c, **kw):
+            self._ts = _dgx_time.time()
+        def on_step_end(self, a, s, c, **kw):
+            dur = _dgx_time.time() - getattr(self, "_ts", _dgx_time.time())
+            elapsed = _dgx_time.time() - getattr(self, "_t0", _dgx_time.time())
+            done, total = s.global_step, (s.max_steps or 1)
+            eta_min = (dur * max(total - done, 0)) / 60 if dur else 0.0
+            logger.info(
+                f"[progress] step {done}/{total}  "
+                f"step_time={dur:.1f}s  elapsed={elapsed/60:.1f}min  "
+                f"eta={eta_min:.1f}min"
+            )
+        def on_save(self, a, s, c, **kw):
+            logger.info(f"[progress] checkpoint saved at step {s.global_step}")
+        def on_log(self, a, s, c, logs=None, **kw):
+            if logs:
+                snip = {k: v for k, v in logs.items() if k in
+                        ("loss", "reward", "reward_std", "grad_norm",
+                         "learning_rate", "kl")}
+                if snip:
+                    logger.info(f"[metrics] step {s.global_step}: {snip}")
+    trainer.add_callback(_DGX_StepProgressCallback())'''
+new_src = src.replace(ANCHOR, ANCHOR + INJECT, 1)
+assert new_src != src, "could not find GRPOTrainer construction anchor"
+tp.write_text(new_src)
+print("train.py patched: disable_tqdm=False + StepProgressCallback added")
+PY
+
+# In-container patch #3 (mirrors the v1 Kaggle eval notebook): truncate
+# broadcast messages to 40 chars before the env's pydantic SurviveAction
+# rejects them. The trained model occasionally emits 41-char broadcasts.
+RUN python - <<'PY'
+import re, pathlib
+ep = pathlib.Path("training/eval.py")
+src = ep.read_text()
+if "MESSAGE_MAX = 40" in src:
+    print("eval.py already patched"); raise SystemExit(0)
+src = src.replace(
+    "def make_llm_action_fn(model, tokenizer):",
+    "MESSAGE_MAX = 40  # SurviveAction.message hard cap\n"
+    "def make_llm_action_fn(model, tokenizer):", 1)
+src = re.sub(
+    r"(\n\s+)return llm_action\b",
+    r"""\1_orig_llm_action = llm_action
+\1def _truncated_llm_action(agent_id, obs):
+\1    a = _orig_llm_action(agent_id, obs)
+\1    if isinstance(a, dict) and a.get("action_type") == "broadcast":
+\1        m = a.get("message")
+\1        if isinstance(m, str) and len(m) > MESSAGE_MAX:
+\1            a["message"] = m[:MESSAGE_MAX]
+\1    return a
+\1return _truncated_llm_action""",
+    src, count=1)
+ep.write_text(src)
+print("eval.py patched: broadcast messages truncated to 40 chars")
+PY
+
+# Make `training` importable as a package.
+RUN test -f training/__init__.py || touch training/__init__.py
+
+RUN mkdir -p /app/lora_dgx /app/plots /app/logs \
+    && chmod -R 777 /app/lora_dgx /app/plots /app/logs
+
+EXPOSE 7860
+
+# Tiny entrypoint — train | eval | serve | bash. No HF push, no sidecar
+# unless the user explicitly asks for them via env vars.
+COPY <<'BASH' /app/entrypoint.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -n "${HF_TOKEN:-}" ]]; then
+    export HUGGINGFACE_TOKEN="$HF_TOKEN"
+    export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+fi
+
+mode="${1:-train}"; shift || true
+
+case "$mode" in
+  train)
+    : "${MAX_STEPS:=20}"
+    : "${SAVE_STEPS:=4}"
+    : "${LR:=1e-5}"
+    : "${OUTPUT_DIR:=/app/lora_dgx}"
+    : "${HUB_REPO:=}"
+
+    echo "=== zombiee v1 DGX training ==="
+    nvidia-smi -L 2>/dev/null || echo "(no GPU detected — will fail / be slow)"
+    echo "  MAX_STEPS=$MAX_STEPS  SAVE_STEPS=$SAVE_STEPS  OUTPUT_DIR=$OUTPUT_DIR"
+    echo "  HUB_REPO=${HUB_REPO:-<disabled>}"
+    echo "==============================="
+
+    args=(
+      --model-name "Qwen/Qwen2.5-3B-Instruct"
+      --max-steps "$MAX_STEPS"
+      --save-steps "$SAVE_STEPS"
+      --save-total-limit 5
+      --num-generations 4
+      --lr "$LR"
+      --temperature 0.9
+      --beta 0.04
+      --lora-r 16
+      --lora-alpha 32
+      --seed 42
+      --output-dir "$OUTPUT_DIR"
+      --report-to tensorboard
+    )
+    if [[ -n "$HUB_REPO" ]]; then
+      args+=( --push-to-hub --hub-model-id "$HUB_REPO" )
+    fi
+    if [[ -n "${RESUME:-}" ]]; then
+      args+=( --resume-from-checkpoint "$RESUME" )
+    fi
+
+    exec python -m training.train "${args[@]}" "$@"
+    ;;
+
+  eval)
+    : "${LORA_PATH:=/app/lora_dgx}"
+    : "${EPISODES:=60}"
+    : "${PLOTS_DIR:=/app/plots}"
+
+    if [[ ! -f "$LORA_PATH/adapter_config.json" && -n "${EXTENDED_REPO:-}" ]]; then
+      echo "=== downloading $EXTENDED_REPO -> $LORA_PATH ==="
+      python -c "
+from huggingface_hub import snapshot_download, login
+import os
+tok = os.environ.get('HF_TOKEN')
+if tok: login(token=tok, add_to_git_credential=False)
+snapshot_download(repo_id=os.environ['EXTENDED_REPO'],
+                  local_dir=os.environ['LORA_PATH'],
+                  ignore_patterns=['checkpoint-*/*','runs/*','eval_results/*'])
+"
+    fi
+
+    echo "=== zombiee v1 DGX eval ==="
+    echo "  LORA_PATH=$LORA_PATH  EPISODES=$EPISODES  PLOTS_DIR=$PLOTS_DIR"
+    echo "==========================="
+    exec python -m training.eval \
+        --lora-path "$LORA_PATH" \
+        --model-name "Qwen/Qwen2.5-3B-Instruct" \
+        --episodes "$EPISODES" \
+        --seed 42 \
+        --plots-dir "$PLOTS_DIR" \
+        "$@"
+    ;;
+
+  serve)
+    exec uvicorn server.app:app --host 0.0.0.0 --port 7860
+    ;;
+
+  bash|sh)
+    exec bash
+    ;;
+
+  *)
+    echo "usage: <train|eval|serve|bash> [extra args]" >&2
+    exit 2
+    ;;
+esac
+BASH
+RUN chmod +x /app/entrypoint.sh
+
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["train"]

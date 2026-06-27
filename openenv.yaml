@@ -1,0 +1,42 @@
+name: survivecity
+version: "1.0.0"
+description: "Multi-Agent Zombie Apocalypse for LLM Failure-Replay Learning"
+task_id: survivecity_v1
+port: 7860
+entry_point: "server.app:app"
+
+authors:
+  - name: Krrish Baghla
+
+themes:
+  - multi_agent       # Theme 1: 3 agents coordinate
+  - long_horizon      # Theme 2: 100-step episodes
+  - self_improvement   # Theme 4: cross-episode failure-replay
+
+features:
+  - hidden_role_infection
+  - safehouse_vote_mechanic
+  - deterministic_postmortem
+  - composable_reward_rubric
+  - no_llm_judge
+
+reward:
+  type: composable
+  rubrics:
+    - name: SurvivalRubric
+      type: dense
+      range: [-0.50, 0.055]
+    - name: VoteRubric
+      type: sparse
+      range: [-0.30, 0.30]
+    - name: GroupOutcomeRubric
+      type: terminal
+      range: [-0.20, 0.70]
+  clamp: [0.01, 0.99]
+  deterministic: true
+
+endpoints:
+  health: /health
+  reset: /reset
+  step: /step
+  state: /state
